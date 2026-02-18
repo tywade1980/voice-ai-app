@@ -1,0 +1,38 @@
+{
+  "expo": {
+    "name": "Voice AI Assistant",
+    "slug": "voice-ai-app",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "backgroundColor": "#1a1a2e"
+    },
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": false
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#1a1a2e"
+      },
+      "permissions": [
+        "RECORD_AUDIO"
+      ],
+      "package": "com.voiceai.assistant"
+    },
+    "plugins": [
+      [
+        "expo-av",
+        {
+          "microphonePermission": "Allow Voice AI to access your microphone for voice conversations."
+        }
+      ],
+      "expo-asset",
+      "expo-font"
+    ]
+  }
+}
