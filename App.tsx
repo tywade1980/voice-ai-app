@@ -72,7 +72,10 @@ export default function App() {
   // ─── Server health check ──────────────────────────────────────────────────
   const checkServer = useCallback(async () => {
     try {
-      const res = await fetch(`${SERVER_URL}/health`, { signal: AbortSignal.timeout(8000) });
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 8000);
+      const res = await fetch(`${SERVER_URL}/health`, { signal: controller.signal });
+      clearTimeout(timer);
       setServerOnline(res.ok);
       return res.ok;
     } catch {
@@ -155,7 +158,7 @@ export default function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model: 'grok-2-audio-latest' }),
-        signal: AbortSignal.timeout(12000),
+        signal: (() => { const c = new AbortController(); setTimeout(() => c.abort(), 12000); return c.signal; })(),
       });
       if (!res.ok) throw new Error(`Session error: ${res.status}`);
       const data = await res.json();
