@@ -11,7 +11,9 @@
       "resizeMode": "contain",
       "backgroundColor": "#0F0F1A"
     },
-    "assetBundlePatterns": ["**/*"],
+    "assetBundlePatterns": [
+      "**/*"
+    ],
     "ios": {
       "supportsTablet": false,
       "bundleIdentifier": "com.tywade1980.caroline",
@@ -46,14 +48,8 @@
     "owner": "tywade1980",
     "extra": {
       "eas": {
-        "projectId": "your-eas-project-id"
+        "projectId": "3af4db2d-524e-49fe-a6d1-82148cfa23dc"
       }
-    },
-    "updates": {
-      "url": "https://u.expo.dev/your-eas-project-id"
-    },
-    "runtimeVersion": {
-      "policy": "appVersion"
     }
   }
 }
