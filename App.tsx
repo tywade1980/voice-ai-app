@@ -118,6 +118,9 @@ export default function App() {
   const isSessionReady      = useRef(false);
   const isDisconnecting     = useRef(false);
 
+  // Always points to the latest handleEvent — prevents stale closure in socket.onmessage
+  const handleEventRef      = useRef<((event: any) => void) | null>(null);
+
   // Message tracking
   const currentAsstId       = useRef<string | null>(null);
 
@@ -257,7 +260,7 @@ export default function App() {
           bitRate: 384000,
         },
         ios: {
-          extension: '.caf',
+          extension: '.wav',
           outputFormat: Audio.IOSOutputFormat.LINEARPCM,
           audioQuality: Audio.IOSAudioQuality.MAX,
           sampleRate: 24000,
@@ -372,21 +375,19 @@ export default function App() {
         socket.send(JSON.stringify({
           type: 'session.update',
           session: {
+            modalities: ['text', 'audio'],
             voice,
             instructions: CAROLINE_SOUL,
             turn_detection: { type: 'server_vad' },
-            tools: [{ type: 'web_search' }, { type: 'x_search' }],
+            input_audio_format: 'pcm16',
+            output_audio_format: 'pcm16',
             input_audio_transcription: { model: 'grok-2-audio' },
-            audio: {
-              input:  { format: { type: 'audio/pcm', rate: 24000 } },
-              output: { format: { type: 'audio/pcm', rate: 24000 } },
-            },
           },
         }));
       };
 
       socket.onmessage = ({ data }) => {
-        try { handleEvent(JSON.parse(data)); } catch {}
+        try { handleEventRef.current?.(JSON.parse(data)); } catch {}
       };
 
       socket.onerror = () => {
@@ -499,6 +500,8 @@ export default function App() {
     }
   }, [startPulse, flushMicBuffer, stopPlayback, sendWs, markInterrupted,
       addMsg, appendMsg, enqueueAudio]);
+
+  handleEventRef.current = handleEvent;
 
   // ── Send Text ──────────────────────────────────────────────────────────────
   const sendText = useCallback(() => {
