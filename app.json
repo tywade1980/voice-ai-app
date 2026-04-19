@@ -1,0 +1,49 @@
+{
+  "expo": {
+    "name": "Caroline AI",
+    "slug": "voice-ai-app",
+    "version": "2.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "backgroundColor": "#0d0d1a"
+    },
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.centauriai.caroline"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#0d0d1a"
+      },
+      "permissions": [
+        "RECORD_AUDIO",
+        "INTERNET",
+        "ACCESS_NETWORK_STATE",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.MODIFY_AUDIO_SETTINGS"
+      ],
+      "package": "com.centauriai.caroline"
+    },
+    "plugins": [
+      [
+        "expo-av",
+        {
+          "microphonePermission": "Caroline needs your microphone to hear you speak."
+        }
+      ],
+      "expo-asset",
+      "expo-font"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "3af4db2d-524e-49fe-a6d1-82148cfa23dc"
+      }
+    },
+    "owner": "tywade1980"
+  }
+}
