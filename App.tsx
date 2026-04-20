@@ -165,8 +165,8 @@ export default function App() {
       if (!uri) return;
       const base64 = await FileSystem.readAsStringAsync(uri, { encoding: FileSystem.EncodingType.Base64 });
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        // Send audio chunk — server_vad handles turn detection, no manual commit needed
         wsRef.current.send(JSON.stringify({ type: 'audio_chunk', data: base64 }));
-        wsRef.current.send(JSON.stringify({ type: 'commit_audio' }));
         console.log('Sent audio chunk, size:', base64.length);
       }
       // Clean up temp file
@@ -222,13 +222,13 @@ export default function App() {
       addMessage('assistant', "Hey! I'm Caroline. What do you need?");
       setIsRecording(true);
 
-      // Start recording in 3-second chunks
+      // Start recording in 5-second chunks — gives xAI enough audio for VAD
       startRecordingChunk();
       recordingIntervalRef.current = setInterval(() => {
         if (wsRef.current?.readyState === WebSocket.OPEN) {
           startRecordingChunk();
         }
-      }, 3000);
+      }, 5000);
     };
 
     ws.onmessage = async (event) => {
@@ -267,7 +267,7 @@ export default function App() {
               if (wsRef.current?.readyState === WebSocket.OPEN) {
                 startRecordingChunk();
               }
-            }, 3000);
+            }, 5000);
           }
         } else if (msg.type === 'speech_started') {
           // xAI VAD detected user speaking — interrupt Caroline if she's talking
