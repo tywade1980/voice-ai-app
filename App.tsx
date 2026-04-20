@@ -129,9 +129,21 @@ export default function App() {
       stopPulse();
       sound.setOnPlaybackStatusUpdate(status => {
         if (status.isLoaded && status.didJustFinish) {
-          setAppState('listening');
-          setStatusText('Listening... speak now');
-          startPulse();
+          // Playback done — resume mic if still connected
+          if (wsRef.current?.readyState === WebSocket.OPEN) {
+            setAppState('listening');
+            setStatusText('Listening... speak now');
+            setIsRecording(true);
+            startPulse();
+            if (!recordingIntervalRef.current) {
+              startRecordingChunk();
+              recordingIntervalRef.current = setInterval(() => {
+                if (wsRef.current?.readyState === WebSocket.OPEN) {
+                  startRecordingChunk();
+                }
+              }, 3000);
+            }
+          }
         }
       });
     } catch (e) {
@@ -227,8 +239,8 @@ export default function App() {
           addMessage('user', msg.text);
         } else if (msg.type === 'transcript_assistant' && msg.text) {
           addMessage('assistant', msg.text);
-        } else if (msg.type === 'audio' && msg.data) {
-          // Stop recording while Caroline speaks
+        } else if (msg.type === 'speaking_start') {
+          // Caroline is about to speak — IMMEDIATELY stop mic to prevent echo
           if (recordingIntervalRef.current) {
             clearInterval(recordingIntervalRef.current);
             recordingIntervalRef.current = null;
@@ -237,9 +249,18 @@ export default function App() {
             try { await recordingRef.current.stopAndUnloadAsync(); } catch {}
             recordingRef.current = null;
           }
+          setIsRecording(false);
+          setAppState('speaking');
+          setStatusText('Caroline is speaking...');
+          stopPulse();
+        } else if (msg.type === 'audio' && msg.data) {
           await playAudio(msg.data);
         } else if (msg.type === 'speaking_end') {
-          // Resume recording after Caroline finishes
+          // Resume recording after Caroline finishes speaking
+          setAppState('listening');
+          setStatusText('Listening... speak now');
+          setIsRecording(true);
+          startPulse();
           if (!recordingIntervalRef.current && wsRef.current?.readyState === WebSocket.OPEN) {
             startRecordingChunk();
             recordingIntervalRef.current = setInterval(() => {
@@ -249,7 +270,7 @@ export default function App() {
             }, 3000);
           }
         } else if (msg.type === 'speech_started') {
-          // User started speaking — interrupt Caroline
+          // xAI VAD detected user speaking — interrupt Caroline if she's talking
           if (soundRef.current) {
             try { await soundRef.current.stopAsync(); } catch {}
           }
