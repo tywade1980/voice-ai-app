@@ -122,6 +122,18 @@ export default function App() {
         playsInSilentModeIOS: true,
         staysActiveInBackground: false,
       });
+      // ── STOP MIC IMMEDIATELY before playback starts ──────────────────────
+      if (recordingIntervalRef.current) {
+        clearInterval(recordingIntervalRef.current);
+        recordingIntervalRef.current = null;
+      }
+      if (recordingRef.current) {
+        try { await recordingRef.current.stopAndUnloadAsync(); } catch {}
+        recordingRef.current = null;
+      }
+      setIsRecording(false);
+      // ─────────────────────────────────────────────────────────────────────
+
       const { sound } = await Audio.Sound.createAsync({ uri }, { shouldPlay: true });
       soundRef.current = sound;
       setAppState('speaking');
@@ -141,7 +153,7 @@ export default function App() {
                 if (wsRef.current?.readyState === WebSocket.OPEN) {
                   startRecordingChunk();
                 }
-              }, 3000);
+              }, 5000);
             }
           }
         }
