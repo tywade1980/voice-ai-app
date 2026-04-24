@@ -5,14 +5,19 @@
   "build": {
     "preview": {
       "distribution": "internal",
+      "channel": "preview",
       "android": {
         "buildType": "apk"
       }
     },
     "production": {
+      "channel": "production",
       "android": {
         "buildType": "apk"
       }
     }
+  },
+  "update": {
+    "server": "https://u.expo.dev/YOUR_PROJECT_ID"
   }
 }
