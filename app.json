@@ -7,6 +7,7 @@
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
     "splash": {
+      "image": "./assets/splash.png",
       "backgroundColor": "#0d0d1a"
     },
     "assetBundlePatterns": [
@@ -18,6 +19,7 @@
     },
     "android": {
       "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#0d0d1a"
       },
       "permissions": [
@@ -37,8 +39,17 @@
         }
       ],
       "expo-asset",
-      "expo-font"
+      "expo-font",
+      "expo-updates"
     ],
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/3af4db2d-524e-49fe-a6d1-82148cfa23dc",
+      "enabled": true,
+      "fallbackToCacheTimeout": 0
+    },
     "extra": {
       "eas": {
         "projectId": "3af4db2d-524e-49fe-a6d1-82148cfa23dc"
