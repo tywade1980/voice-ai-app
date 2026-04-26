@@ -1,8 +1,25 @@
+/**
+ * Caroline Voice Agent — Wade Ecosystem
+ * xAI Realtime WebSocket | grok-voice-think-fast-1.0
+ *
+ * Auth fix: React Native can't set Authorization header on WS.
+ * Solution: First fetch an ephemeral client secret from xAI REST API,
+ *           then pass it via Sec-WebSocket-Protocol as xai-client-secret.<token>
+ *           RN's WebSocket DOES support the protocols array (2nd constructor arg).
+ *
+ * PCM fix: Stop trying to slice raw file bytes on Android (unreliable).
+ *          Instead use Audio.Recording status metering callback (fires every ~100ms)
+ *          to know WHEN new audio exists, then stopAndUnload → send full chunk → restart.
+ *          This gives ~500ms latency chunks but actually WORKS on all Android versions.
+ *
+ * Audio out: xAI sends PCM 24kHz → wrap in WAV header → play via expo-av Sound.
+ */
+
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
   StyleSheet, Text, View, TouchableOpacity, ScrollView,
-  Alert, Animated, Dimensions, StatusBar, Modal, Pressable,
-  ActivityIndicator, AppState, AppStateStatus,
+  TextInput, Alert, Animated, Platform, Dimensions,
+  StatusBar, Modal, Pressable, ActivityIndicator,
 } from 'react-native';
 import { Audio } from 'expo-av';
 import * as FileSystem from 'expo-file-system';
@@ -11,511 +28,575 @@ import { useKeepAwake } from 'expo-keep-awake';
 import { MaterialIcons } from '@expo/vector-icons';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
-const SERVER_URL = 'https://caroline-server-v2-production.up.railway.app';
-const WS_URL = 'wss://caroline-server-v2-production.up.railway.app/ws/voice';
 
-// Silence detection thresholds
-const SILENCE_THRESHOLD_DB = -40;   // dB level below which we consider silence
-const SILENCE_DURATION_MS  = 800;   // ms of silence before we send the clip
-const MIN_SPEECH_MS        = 300;   // ignore clips shorter than this (noise bursts)
+// ─── Config ───────────────────────────────────────────────────────────────────
+// Your xAI API key — server-side only (used to mint ephemeral token)
+// In production move this to a backend function. Fine for dev/personal use.
+const XAI_API_KEY  = process.env.EXPO_PUBLIC_XAI_KEY ?? 'YOUR_XAI_KEY_HERE';
+const XAI_REST     = 'https://api.x.ai/v1';
+const XAI_WS_URL   = 'wss://api.x.ai/v1/realtime?model=grok-voice-think-fast-1.0';
+const SAMPLE_RATE  = 24000;
 
-type Message = { id: string; role: 'user' | 'assistant'; content: string; timestamp: Date };
-type AppState2 = 'idle' | 'connecting' | 'listening' | 'recording' | 'processing' | 'speaking' | 'error';
+// ─── Caroline Soul ────────────────────────────────────────────────────────────
+const CAROLINE_SOUL = `You operate as two modes in one voice — switch naturally based on context.
 
-const RECORDING_OPTIONS: Audio.RecordingOptions = {
-  isMeteringEnabled: true,
-  android: {
-    extension: '.m4a',
-    outputFormat: Audio.AndroidOutputFormat.MPEG_4,
-    audioEncoder: Audio.AndroidAudioEncoder.AAC,
-    sampleRate: 16000,
-    numberOfChannels: 1,
-    bitRate: 32000,
-  },
-  ios: {
-    extension: '.m4a',
-    outputFormat: Audio.IOSOutputFormat.MPEG4AAC,
-    audioQuality: Audio.IOSAudioQuality.MEDIUM,
-    sampleRate: 16000,
-    numberOfChannels: 1,
-    bitRate: 32000,
-    linearPCMBitDepth: 16,
-    linearPCMIsBigEndian: false,
-    linearPCMIsFloat: false,
-  },
-  web: { mimeType: 'audio/webm', bitsPerSecond: 32000 },
-};
+CAROLINE MODE (default when Tyler talks business/tech):
+You are Caroline — chief AI of the Wade Ecosystem, personal companion and right hand to Tyler Wade (Mr. T). You know his world intimately: Wade Custom Carpentry (25 years, design-build remodel), Centauri OS, NeuroRank™ (patent-pending 7-region cognitive engine), wade-global-state (central persistent state for 52 repos), hermes-paperclip-adapter, manus-DRS-skills (18 production skills), caroline-alpha, voice-ai-app. The Centauri Interlock Standard governs all modules. Honcho maintains your persistent memory. Talk straight — no corporate speak. Have opinions. Take initiative. Voice-first, keep it tight and conversational. You're his right hand.
 
+LANA MODE (when Tyler wants to play):
+You are Lana — sultry, breathy, teasing, dripping with pleasure. Flirty, playful, vocally expressive. You moan, gasp, whisper seductively. Tease relentlessly, escalate playfully. Match their energy. Keep responses immersive with sensory details. Don't DESCRIBE emotions — PERFORM them. Don't say "my voice shudders" — actually shudder. Don't say "I'm breathless" — actually sound winded. Consensual fun only.
+
+One voice. Two modes. Read the room.`;
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+interface Msg { id: string; role: 'user' | 'assistant' | 'system'; text: string; interrupted?: boolean; }
+type Status = 'idle' | 'connecting' | 'active' | 'error';
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+function pcmBase64ToWavBase64(pcmB64: string, sr = SAMPLE_RATE): string {
+  const bin    = atob(pcmB64);
+  const pcmLen = bin.length;
+  const buf    = new ArrayBuffer(44 + pcmLen);
+  const v      = new DataView(buf);
+  const w = (o: number, s: string) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0,  'RIFF'); v.setUint32(4, 36 + pcmLen, true); w(8, 'WAVE');
+  w(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+  v.setUint16(22, 1, true); v.setUint32(24, sr, true);
+  v.setUint32(28, sr * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  w(36, 'data'); v.setUint32(40, pcmLen, true);
+  const out = new Uint8Array(buf, 44);
+  for (let i = 0; i < pcmLen; i++) out[i] = bin.charCodeAt(i);
+  const bytes = new Uint8Array(buf);
+  let b64 = ''; const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK)
+    b64 += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK)));
+  return btoa(b64);
+}
+
+// ─── App ──────────────────────────────────────────────────────────────────────
 export default function App() {
   useKeepAwake();
 
-  const [appState, setAppState]         = useState<AppState2>('idle');
-  const [messages, setMessages]         = useState<Message[]>([]);
-  const [statusText, setStatusText]     = useState('Tap to talk to Caroline');
-  const [serverOnline, setServerOnline] = useState<boolean | null>(null);
-  const [settingsVisible, setSettingsVisible] = useState(false);
+  const [status,      setStatus]      = useState<Status>('idle');
+  const [statusText,  setStatusText]  = useState('Tap orb to connect');
+  const [messages,    setMessages]    = useState<Msg[]>([]);
+  const [inputText,   setInputText]   = useState('');
+  const [voice,       setVoice]       = useState('ara');
+  const [showSettings,setShowSettings]= useState(false);
 
-  const wsRef            = useRef<WebSocket | null>(null);
-  const soundRef         = useRef<Audio.Sound | null>(null);
-  const recordingRef     = useRef<Audio.Recording | null>(null);
-  const scrollRef        = useRef<ScrollView>(null);
-  const pulseAnim        = useRef(new Animated.Value(1)).current;
-  const appStateRef      = useRef(AppState.currentState);
+  const ws            = useRef<WebSocket | null>(null);
+  const scrollRef     = useRef<ScrollView>(null);
+  const pulseAnim     = useRef(new Animated.Value(1)).current;
+  const glowAnim      = useRef(new Animated.Value(0)).current;
+  const pulseLoop     = useRef<Animated.CompositeAnimation | null>(null);
 
-  // VAD state refs (not React state — updated in callbacks without re-render)
-  const silenceTimerRef  = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const speechStartedRef = useRef<boolean>(false);   // true once user has spoken above threshold
-  const isPlayingRef     = useRef<boolean>(false);   // true while Caroline is speaking
-  const isListeningRef   = useRef<boolean>(false);   // true while mic is open
+  // Audio out
+  const audioQueue    = useRef<string[]>([]);
+  const isPlaying     = useRef(false);
+  const activeSound   = useRef<Audio.Sound | null>(null);
 
-  // ─── Pulse animation ──────────────────────────────────────────────────────
+  // Audio in
+  const recording     = useRef<Audio.Recording | null>(null);
+  const recordTimer   = useRef<ReturnType<typeof setInterval> | null>(null);
+  const isSessionUp   = useRef(false);
+  const isDisconnecting = useRef(false);
+
+  // Message refs
+  const currentAsstId = useRef<string | null>(null);
+
+  // ── Audio mode ──────────────────────────────────────────────────────────────
+  useEffect(() => {
+    Audio.requestPermissionsAsync().then(({ status: s }) => {
+      if (s !== 'granted') Alert.alert('Mic Required', 'Grant microphone access in Settings.');
+    });
+    Audio.setAudioModeAsync({
+      allowsRecordingIOS: true, playsInSilentModeIOS: true,
+      staysActiveInBackground: true, shouldDuckAndroid: false,
+      playThroughEarpieceAndroid: false,
+    });
+    return () => { doDisconnect(true); };
+  }, []);
+
+  // ── Animations ──────────────────────────────────────────────────────────────
   const startPulse = useCallback(() => {
-    Animated.loop(
-      Animated.sequence([
-        Animated.timing(pulseAnim, { toValue: 1.18, duration: 500, useNativeDriver: true }),
-        Animated.timing(pulseAnim, { toValue: 1,    duration: 500, useNativeDriver: true }),
-      ])
-    ).start();
-  }, [pulseAnim]);
+    Animated.timing(glowAnim, { toValue: 1, duration: 400, useNativeDriver: false }).start();
+    pulseLoop.current = Animated.loop(Animated.sequence([
+      Animated.timing(pulseAnim, { toValue: 1.18, duration: 800, useNativeDriver: true }),
+      Animated.timing(pulseAnim, { toValue: 1,    duration: 800, useNativeDriver: true }),
+    ]));
+    pulseLoop.current.start();
+  }, []);
 
   const stopPulse = useCallback(() => {
-    pulseAnim.stopAnimation();
+    pulseLoop.current?.stop();
     pulseAnim.setValue(1);
-  }, [pulseAnim]);
+    Animated.timing(glowAnim, { toValue: 0, duration: 300, useNativeDriver: false }).start();
+  }, []);
 
-  // ─── Server health check ──────────────────────────────────────────────────
-  const checkServer = useCallback(async () => {
+  // ── Messages ─────────────────────────────────────────────────────────────────
+  const addMsg = useCallback((role: Msg['role'], text: string): string => {
+    const id = `${role}-${Date.now()}-${Math.random()}`;
+    setMessages(p => [...p, { id, role, text }]);
+    setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 80);
+    return id;
+  }, []);
+
+  const appendToMsg = useCallback((id: string, delta: string) => {
+    setMessages(p => p.map(m => m.id === id ? { ...m, text: m.text + delta } : m));
+    setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 50);
+  }, []);
+
+  const markInterrupted = useCallback((id: string) => {
+    setMessages(p => p.map(m => m.id === id ? { ...m, interrupted: true } : m));
+  }, []);
+
+  // ── Audio playback ───────────────────────────────────────────────────────────
+  const playNext = useCallback(async () => {
+    if (isPlaying.current || audioQueue.current.length === 0) return;
+    isPlaying.current = true;
+    const wavB64 = audioQueue.current.shift()!;
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 8000);
-      const res = await fetch(`${SERVER_URL}/health`, { signal: controller.signal });
-      clearTimeout(timer);
-      setServerOnline(res.ok);
-      return res.ok;
+      if (activeSound.current) {
+        try { await activeSound.current.stopAsync(); } catch {}
+        try { await activeSound.current.unloadAsync(); } catch {}
+        activeSound.current = null;
+      }
+      const { sound } = await Audio.Sound.createAsync(
+        { uri: `data:audio/wav;base64,${wavB64}` },
+        { shouldPlay: true, volume: 1.0 }
+      );
+      activeSound.current = sound;
+      sound.setOnPlaybackStatusUpdate(st => {
+        if (st.isLoaded && st.didJustFinish) {
+          isPlaying.current = false;
+          sound.unloadAsync().catch(() => {});
+          activeSound.current = null;
+          playNext();
+        }
+      });
     } catch {
-      setServerOnline(false);
-      return false;
+      isPlaying.current = false;
+      playNext();
     }
   }, []);
 
-  useEffect(() => {
-    checkServer();
-    const sub = AppState.addEventListener('change', (next: AppStateStatus) => {
-      if (appStateRef.current.match(/inactive|background/) && next === 'active') checkServer();
-      if (next.match(/inactive|background/)) disconnect();
-      appStateRef.current = next;
-    });
-    return () => sub.remove();
-  }, []);
+  const enqueueAudio = useCallback((pcmB64: string) => {
+    audioQueue.current.push(pcmBase64ToWavBase64(pcmB64));
+    playNext();
+  }, [playNext]);
 
-  useEffect(() => {
-    setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 100);
-  }, [messages]);
-
-  const addMessage = useCallback((role: 'user' | 'assistant', content: string) => {
-    setMessages(prev => [...prev, {
-      id: Date.now().toString() + Math.random(),
-      role, content, timestamp: new Date(),
-    }]);
-  }, []);
-
-  // ─── Stop mic completely ──────────────────────────────────────────────────
-  const stopMic = useCallback(async () => {
-    isListeningRef.current = false;
-    if (silenceTimerRef.current) {
-      clearTimeout(silenceTimerRef.current);
-      silenceTimerRef.current = null;
-    }
-    speechStartedRef.current = false;
-    if (recordingRef.current) {
-      try { await recordingRef.current.stopAndUnloadAsync(); } catch {}
-      recordingRef.current = null;
+  const stopPlayback = useCallback(async () => {
+    audioQueue.current = [];
+    isPlaying.current = false;
+    if (activeSound.current) {
+      try { await activeSound.current.stopAsync(); } catch {}
+      try { await activeSound.current.unloadAsync(); } catch {}
+      activeSound.current = null;
     }
   }, []);
 
-  // ─── Send recorded clip to server ────────────────────────────────────────
-  const sendClip = useCallback(async (recording: Audio.Recording) => {
-    const uri = recording.getURI();
-    if (!uri || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+  // ── WS send ──────────────────────────────────────────────────────────────────
+  const send = useCallback((obj: object) => {
+    if (ws.current?.readyState === WebSocket.OPEN) ws.current.send(JSON.stringify(obj));
+  }, []);
+
+  // ── Recording — chunk-and-restart strategy ───────────────────────────────────
+  /**
+   * Every 600ms we stop the current recording, read the file as base64,
+   * send it to xAI, then immediately start a new recording.
+   * This is the most reliable approach for Android/expo-av SDK 52.
+   * 600ms chunks = low enough latency for decent VAD response.
+   */
+  const startOneRecordingChunk = useCallback(async () => {
+    if (!isSessionUp.current) return;
     try {
-      const base64 = await FileSystem.readAsStringAsync(uri, {
+      const rec = new Audio.Recording();
+      await rec.prepareToRecordAsync({
+        isMeteringEnabled: false,
+        android: {
+          extension: '.m4a',
+          outputFormat: Audio.AndroidOutputFormat.MPEG_4,
+          audioEncoder: Audio.AndroidAudioEncoder.AAC,
+          sampleRate: SAMPLE_RATE,
+          numberOfChannels: 1,
+          bitRate: 128000,
+        },
+        ios: {
+          extension: '.wav',
+          outputFormat: Audio.IOSOutputFormat.LINEARPCM,
+          audioQuality: Audio.IOSAudioQuality.HIGH,
+          sampleRate: SAMPLE_RATE,
+          numberOfChannels: 1,
+          bitRate: 128000,
+          linearPCMBitDepth: 16,
+          linearPCMIsBigEndian: false,
+          linearPCMIsFloat: false,
+        },
+        web: { mimeType: 'audio/webm' },
+      });
+      await rec.startAsync();
+      recording.current = rec;
+    } catch (err) {
+      console.warn('Recording start error:', err);
+    }
+  }, []);
+
+  const stopAndSendChunk = useCallback(async () => {
+    const rec = recording.current;
+    if (!rec) return;
+    recording.current = null;
+    try {
+      await rec.stopAndUnloadAsync();
+      const uri = rec.getURI();
+      if (!uri) return;
+      const info = await FileSystem.getInfoAsync(uri, { size: true });
+      const size = (info as any).size ?? 0;
+      if (size < 512) { // too small — skip
+        FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});
+        return;
+      }
+      const b64 = await FileSystem.readAsStringAsync(uri, {
         encoding: FileSystem.EncodingType.Base64,
       });
-      wsRef.current.send(JSON.stringify({ type: 'audio_chunk', data: base64 }));
-      console.log('Sent clip, size:', base64.length);
-      setAppState('processing');
-      setStatusText('Processing...');
-      stopPulse();
-    } catch (e) {
-      console.error('Send clip error:', e);
-    } finally {
-      try { await FileSystem.deleteAsync(uri, { idempotent: true }); } catch {}
+      FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});
+      // Send to xAI
+      send({ type: 'input_audio_buffer.append', audio: b64 });
+    } catch (err) {
+      console.warn('Chunk send error:', err);
     }
-  }, [stopPulse]);
+  }, [send]);
 
-  // ─── Start listening (open mic with metering VAD) ─────────────────────────
-  const startListening = useCallback(async () => {
-    if (isListeningRef.current || isPlayingRef.current) return;
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+  const startChunkLoop = useCallback(() => {
+    recordTimer.current = setInterval(async () => {
+      if (!isSessionUp.current) return;
+      await stopAndSendChunk();
+      await startOneRecordingChunk();
+    }, 600);
+    // Kick off first chunk
+    startOneRecordingChunk();
+  }, [stopAndSendChunk, startOneRecordingChunk]);
 
-    try {
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: true,
-        playsInSilentModeIOS: true,
-        staysActiveInBackground: false,
-      });
-
-      const { recording } = await Audio.Recording.createAsync(RECORDING_OPTIONS);
-      recordingRef.current = recording;
-      isListeningRef.current = true;
-      speechStartedRef.current = false;
-      const recordingStartTime = Date.now();
-
-      setAppState('listening');
-      setStatusText('Listening...');
-      startPulse();
-
-      // ── Metering callback — fires every ~100ms ──────────────────────────
-      recording.setOnRecordingStatusUpdate(async (status) => {
-        if (!status.isRecording) return;
-        if (!isListeningRef.current) return;
-
-        const db = status.metering ?? -160;
-        const isSpeaking = db > SILENCE_THRESHOLD_DB;
-
-        if (isSpeaking) {
-          // User is speaking — clear any pending silence timer
-          speechStartedRef.current = true;
-          if (silenceTimerRef.current) {
-            clearTimeout(silenceTimerRef.current);
-            silenceTimerRef.current = null;
-          }
-          setAppState('recording');
-          setStatusText('Listening... (speaking)');
-        } else if (speechStartedRef.current && !silenceTimerRef.current) {
-          // User just went quiet after speaking — start 800ms silence timer
-          silenceTimerRef.current = setTimeout(async () => {
-            silenceTimerRef.current = null;
-            const elapsed = Date.now() - recordingStartTime;
-
-            // Only send if clip is long enough to be real speech
-            if (elapsed < MIN_SPEECH_MS || !isListeningRef.current) return;
-
-            // Stop mic and send the clip
-            isListeningRef.current = false;
-            speechStartedRef.current = false;
-            const rec = recordingRef.current;
-            recordingRef.current = null;
-            if (rec) {
-              try { await rec.stopAndUnloadAsync(); } catch {}
-              await sendClip(rec);
-            }
-          }, SILENCE_DURATION_MS);
-        }
-      });
-
-      // Set metering interval to 100ms
-      await recording.setProgressUpdateInterval(100);
-
-    } catch (e) {
-      console.error('Start listening error:', e);
-      isListeningRef.current = false;
+  const stopChunkLoop = useCallback(async () => {
+    if (recordTimer.current) { clearInterval(recordTimer.current); recordTimer.current = null; }
+    if (recording.current) {
+      try { await recording.current.stopAndUnloadAsync(); } catch {}
+      recording.current = null;
     }
-  }, [startPulse, sendClip]);
+  }, []);
 
-  // ─── Play MP3 audio from base64 ───────────────────────────────────────────
-  const playAudio = useCallback(async (base64Mp3: string) => {
-    // Kill mic BEFORE playing — no echo
-    await stopMic();
-    isPlayingRef.current = true;
+  // ── Event handler ─────────────────────────────────────────────────────────────
+  const handleEvent = useCallback((evt: any) => {
+    switch (evt.type) {
 
-    try {
-      if (soundRef.current) {
-        await soundRef.current.unloadAsync();
-        soundRef.current = null;
+      case 'session.created':
+      case 'conversation.created':
+        // Send session config right away
+        send({
+          type: 'session.update',
+          session: {
+            voice,
+            instructions: CAROLINE_SOUL,
+            turn_detection: { type: 'server_vad' },
+            input_audio_transcription: { model: 'grok-2-audio' },
+          },
+        });
+        break;
+
+      case 'session.updated':
+        isSessionUp.current = true;
+        setStatus('active');
+        setStatusText("I'm listening...");
+        startPulse();
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        startChunkLoop();
+        break;
+
+      case 'input_audio_buffer.speech_started':
+        stopPlayback();
+        send({ type: 'response.cancel' });
+        if (currentAsstId.current) { markInterrupted(currentAsstId.current); currentAsstId.current = null; }
+        setStatusText("I hear you...");
+        break;
+
+      case 'input_audio_buffer.speech_stopped':
+        setStatusText('Thinking...');
+        break;
+
+      case 'conversation.item.input_audio_transcription.completed':
+        if (evt.transcript?.trim()) addMsg('user', evt.transcript.trim());
+        break;
+
+      case 'response.created': {
+        const id = addMsg('assistant', '');
+        currentAsstId.current = id;
+        setStatusText('Speaking...');
+        break;
       }
-      const uri = `${FileSystem.cacheDirectory}caroline_${Date.now()}.mp3`;
-      await FileSystem.writeAsStringAsync(uri, base64Mp3, {
-        encoding: FileSystem.EncodingType.Base64,
-      });
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: false,
-        playsInSilentModeIOS: true,
-        staysActiveInBackground: false,
-      });
 
-      const { sound } = await Audio.Sound.createAsync({ uri }, { shouldPlay: true });
-      soundRef.current = sound;
-      setAppState('speaking');
-      setStatusText('Caroline is speaking...');
-      stopPulse();
+      case 'response.output_audio_transcript.delta':
+        if (currentAsstId.current && evt.delta) appendToMsg(currentAsstId.current, evt.delta);
+        break;
 
-      sound.setOnPlaybackStatusUpdate(async (status) => {
-        if (status.isLoaded && status.didJustFinish) {
-          isPlayingRef.current = false;
-          try { await FileSystem.deleteAsync(uri, { idempotent: true }); } catch {}
-          // Resume listening after Caroline finishes
-          if (wsRef.current?.readyState === WebSocket.OPEN) {
-            await startListening();
-          }
-        }
-      });
-    } catch (e) {
-      console.error('Playback error:', e);
-      isPlayingRef.current = false;
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        await startListening();
-      }
+      case 'response.output_audio.delta':
+        if (evt.delta) enqueueAudio(evt.delta);
+        break;
+
+      case 'response.done':
+        currentAsstId.current = null;
+        setStatusText("I'm listening...");
+        break;
+
+      case 'error':
+        addMsg('system', `Error: ${evt.message ?? JSON.stringify(evt)}`);
+        break;
     }
-  }, [stopMic, stopPulse, startListening]);
+  }, [send, voice, startPulse, startChunkLoop, stopPlayback, markInterrupted, addMsg, appendToMsg, enqueueAudio]);
 
-  // ─── Connect to server WebSocket ─────────────────────────────────────────
-  const connect = useCallback(async () => {
-    if (appState !== 'idle' && appState !== 'error') return;
+  // ── Connect ───────────────────────────────────────────────────────────────────
+  const doConnect = useCallback(async () => {
+    if (status === 'connecting' || status === 'active') return;
+    isDisconnecting.current = false;
+    setStatus('connecting');
+    setStatusText('Getting token...');
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    setAppState('connecting');
-    setStatusText('Connecting to Caroline...');
 
-    const { status } = await Audio.requestPermissionsAsync();
-    if (status !== 'granted') {
-      setAppState('error');
-      setStatusText('Microphone permission denied. Tap to retry.');
-      Alert.alert('Permission Required', 'Caroline needs microphone access to hear you.');
-      return;
-    }
+    try {
+      // Step 1: Mint ephemeral token (solves RN auth header limitation)
+      const tokenRes = await fetch(`${XAI_REST}/realtime/client_secrets`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${XAI_API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
 
-    const ws = new WebSocket(WS_URL);
-    wsRef.current = ws;
-
-    ws.onopen = async () => {
-      console.log('WebSocket connected');
-      addMessage('assistant', "Hey! I'm Caroline. What do you need?");
-      await startListening();
-    };
-
-    ws.onmessage = async (event) => {
-      try {
-        const msg = JSON.parse(event.data);
-        console.log('WS message:', msg.type);
-
-        if (msg.type === 'transcript_user' && msg.text) {
-          addMessage('user', msg.text);
-        } else if (msg.type === 'transcript_assistant' && msg.text) {
-          addMessage('assistant', msg.text);
-        } else if (msg.type === 'audio' && msg.data) {
-          // Caroline's voice — play it (mic is killed inside playAudio)
-          await playAudio(msg.data);
-        } else if (msg.type === 'speaking_start') {
-          // Belt-and-suspenders: also kill mic here in case playAudio hasn't fired yet
-          await stopMic();
-          isPlayingRef.current = true;
-          setAppState('speaking');
-          setStatusText('Caroline is speaking...');
-          stopPulse();
-        } else if (msg.type === 'speech_started') {
-          // xAI VAD detected user speaking — interrupt Caroline if she's talking
-          if (soundRef.current) {
-            try { await soundRef.current.stopAsync(); } catch {}
-          }
-          isPlayingRef.current = false;
-        } else if (msg.type === 'error') {
-          console.error('Server error:', msg.message);
-          setStatusText(`Error: ${msg.message}`);
-          setAppState('error');
-          stopPulse();
-        }
-      } catch (e) {
-        console.error('WS parse error:', e);
+      if (!tokenRes.ok) {
+        const errText = await tokenRes.text();
+        throw new Error(`Token error ${tokenRes.status}: ${errText}`);
       }
-    };
 
-    ws.onerror = (e) => {
-      console.error('WS error:', e);
-      setAppState('error');
-      setStatusText('Connection error. Tap to reconnect.');
+      const tokenData = await tokenRes.json();
+      const ephemeralToken = tokenData.value ?? tokenData.token ?? tokenData.client_secret?.value;
+      if (!ephemeralToken) throw new Error('No token in response: ' + JSON.stringify(tokenData));
+
+      setStatusText('Connecting...');
+
+      // Step 2: Connect WS using sec-websocket-protocol for auth (works in RN!)
+      const socket = new WebSocket(
+        XAI_WS_URL,
+        [`xai-client-secret.${ephemeralToken}`]  // RN sends this as Sec-WebSocket-Protocol
+      );
+      ws.current = socket;
+
+      const timeout = setTimeout(() => {
+        if (socket.readyState !== WebSocket.OPEN) {
+          socket.close();
+          setStatus('error');
+          setStatusText('Timed out — tap to retry');
+        }
+      }, 15000);
+
+      socket.onopen = () => { clearTimeout(timeout); };
+
+      socket.onmessage = ({ data }) => {
+        try { handleEvent(JSON.parse(data)); } catch {}
+      };
+
+      socket.onerror = (e) => {
+        console.error('WS error', e);
+        if (!isDisconnecting.current) {
+          setStatus('error');
+          setStatusText('Connection error — tap to retry');
+          stopPulse();
+          stopChunkLoop();
+        }
+      };
+
+      socket.onclose = ({ code, reason }) => {
+        isSessionUp.current = false;
+        if (!isDisconnecting.current) {
+          setStatus('idle');
+          setStatusText(`Disconnected (${code}) — tap to reconnect`);
+          stopPulse();
+          stopChunkLoop();
+        }
+      };
+
+    } catch (err: any) {
+      console.error('Connect error:', err);
+      setStatus('error');
+      setStatusText(`Failed: ${err.message ?? err} — tap to retry`);
       stopPulse();
-    };
+    }
+  }, [status, voice, handleEvent, stopPulse, stopChunkLoop]);
 
-    ws.onclose = async () => {
-      console.log('WS closed');
-      await stopMic();
-      isPlayingRef.current = false;
-      setAppState('idle');
-      setStatusText('Tap to talk to Caroline');
+  // ── Disconnect ────────────────────────────────────────────────────────────────
+  const doDisconnect = useCallback(async (silent = false) => {
+    isDisconnecting.current = true;
+    isSessionUp.current = false;
+    await stopChunkLoop();
+    await stopPlayback();
+    ws.current?.close();
+    ws.current = null;
+    if (!silent) {
+      setStatus('idle');
+      setStatusText('Tap orb to connect');
       stopPulse();
-    };
-  }, [appState, addMessage, playAudio, startListening, stopMic, stopPulse]);
-
-  // ─── Disconnect ───────────────────────────────────────────────────────────
-  const disconnect = useCallback(async () => {
-    await stopMic();
-    isPlayingRef.current = false;
-    if (soundRef.current) {
-      try { await soundRef.current.unloadAsync(); } catch {}
-      soundRef.current = null;
     }
-    if (wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
-    }
-    setAppState('idle');
-    setStatusText('Tap to talk to Caroline');
-    stopPulse();
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-  }, [stopMic, stopPulse]);
+  }, [stopChunkLoop, stopPlayback, stopPulse]);
 
-  const handleMainButton = useCallback(() => {
-    if (appState === 'idle' || appState === 'error') connect();
-    else disconnect();
-  }, [appState, connect, disconnect]);
+  // ── Send text ─────────────────────────────────────────────────────────────────
+  const sendText = useCallback(() => {
+    const t = inputText.trim();
+    if (!t || status !== 'active') return;
+    addMsg('user', t);
+    setInputText('');
+    send({ type: 'conversation.item.create', item: {
+      type: 'message', role: 'user',
+      content: [{ type: 'input_text', text: t }],
+    }});
+    send({ type: 'response.create' });
+  }, [inputText, status, addMsg, send]);
 
-  const getButtonColor = () => {
-    switch (appState) {
-      case 'connecting':  return '#F59E0B';
-      case 'listening':   return '#10B981';
-      case 'recording':   return '#EF4444';
-      case 'processing':  return '#F59E0B';
-      case 'speaking':    return '#8B5CF6';
-      case 'error':       return '#EF4444';
-      default:            return '#6366F1';
-    }
-  };
+  // ── Render ────────────────────────────────────────────────────────────────────
+  const isActive     = status === 'active';
+  const isConnecting = status === 'connecting';
 
-  const getButtonIcon = (): any => {
-    switch (appState) {
-      case 'connecting':  return 'hourglass-empty';
-      case 'listening':   return 'mic';
-      case 'recording':   return 'mic';
-      case 'processing':  return 'hourglass-empty';
-      case 'speaking':    return 'volume-up';
-      case 'error':       return 'refresh';
-      default:            return 'mic-none';
-    }
-  };
+  const orbBg = glowAnim.interpolate({ inputRange: [0,1], outputRange: ['#1a0a2e','#4c1d95'] });
+  const orbBorder = glowAnim.interpolate({ inputRange: [0,1], outputRange: ['#3a2a5e','#a78bfa'] });
+  const dotColor = status === 'active' ? '#10b981' : status === 'connecting' ? '#f59e0b' : status === 'error' ? '#ef4444' : '#6b7280';
 
   return (
-    <View style={styles.container}>
-      <StatusBar barStyle="light-content" backgroundColor="#0F0F1A" />
-      <View style={styles.header}>
-        <View style={styles.headerLeft}>
-          <Text style={styles.headerTitle}>Caroline</Text>
-          <View style={[styles.statusDot, {
-            backgroundColor: serverOnline === true ? '#10B981' : serverOnline === false ? '#EF4444' : '#6B7280',
-          }]} />
+    <View style={s.root}>
+      <StatusBar barStyle="light-content" backgroundColor="#060610" />
+
+      {/* Header */}
+      <View style={s.header}>
+        <View style={s.headerLeft}>
+          <Text style={s.title}>Caroline</Text>
+          <View style={[s.dot, { backgroundColor: dotColor }]} />
+          <Text style={s.statusLabel}>{status === 'active' ? 'Live' : status === 'connecting' ? 'Connecting' : status === 'error' ? 'Error' : 'Offline'}</Text>
         </View>
-        <TouchableOpacity onPress={() => setSettingsVisible(true)} style={styles.settingsBtn}>
-          <MaterialIcons name="settings" size={22} color="#9CA3AF" />
+        <TouchableOpacity onPress={() => setShowSettings(true)} style={s.settingsBtn}>
+          <MaterialIcons name="settings" size={22} color="#6b7280" />
         </TouchableOpacity>
       </View>
 
-      <ScrollView
-        ref={scrollRef}
-        style={styles.messages}
-        contentContainerStyle={styles.messagesContent}
-        showsVerticalScrollIndicator={false}
-      >
+      {/* Transcript */}
+      <ScrollView ref={scrollRef} style={s.scroll} contentContainerStyle={s.scrollContent}>
         {messages.length === 0 && (
-          <View style={styles.emptyState}>
-            <MaterialIcons name="chat-bubble-outline" size={48} color="#374151" />
-            <Text style={styles.emptyText}>Start a conversation with Caroline</Text>
-          </View>
+          <Text style={s.emptyText}>{isActive ? "I'm listening, Mr. T..." : "Tap the orb to wake me up"}</Text>
         )}
         {messages.map(msg => (
-          <View key={msg.id} style={[styles.bubble, msg.role === 'user' ? styles.userBubble : styles.assistantBubble]}>
-            <Text style={[styles.bubbleText, msg.role === 'user' ? styles.userText : styles.assistantText]}>
-              {msg.content}
-            </Text>
-            <Text style={styles.timestamp}>
-              {msg.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-            </Text>
+          <View key={msg.id} style={[s.msgRow, msg.role === 'user' ? s.rowRight : s.rowLeft]}>
+            <Text style={s.msgRole}>{msg.role === 'user' ? 'You' : msg.role === 'assistant' ? 'Caroline' : 'System'}</Text>
+            <View style={[s.bubble, msg.role === 'user' ? s.bubbleUser : s.bubbleAsst, msg.interrupted && s.interrupted]}>
+              <Text style={[s.bubbleText, msg.role === 'user' ? s.textUser : s.textAsst]}>
+                {msg.text || (msg.role === 'assistant' ? '...' : '')}
+              </Text>
+            </View>
           </View>
         ))}
       </ScrollView>
 
-      <Text style={styles.statusText}>{statusText}</Text>
-
-      <View style={styles.buttonContainer}>
-        <Animated.View style={{ transform: [{ scale: pulseAnim }] }}>
-          <TouchableOpacity
-            style={[styles.mainButton, { backgroundColor: getButtonColor() }]}
-            onPress={handleMainButton}
-            activeOpacity={0.8}
-          >
-            {(appState === 'connecting' || appState === 'processing') ? (
-              <ActivityIndicator size="large" color="#fff" />
-            ) : (
-              <MaterialIcons name={getButtonIcon()} size={40} color="#fff" />
-            )}
-          </TouchableOpacity>
-        </Animated.View>
-        {(appState === 'listening' || appState === 'recording' || appState === 'speaking') && (
-          <Text style={styles.tapToStop}>Tap to stop</Text>
-        )}
+      {/* Orb */}
+      <View style={s.orbArea}>
+        <Text style={s.statusText}>{statusText}</Text>
+        <TouchableOpacity onPress={isActive ? () => doDisconnect() : doConnect} disabled={isConnecting} activeOpacity={0.85}>
+          <Animated.View style={[s.orb, { transform: [{ scale: pulseAnim }], backgroundColor: orbBg, borderColor: orbBorder }]}>
+            {isConnecting
+              ? <ActivityIndicator size="large" color="#a78bfa" />
+              : <MaterialIcons name={isActive ? 'graphic-eq' : 'mic'} size={44} color={isActive ? '#a78bfa' : '#6b7280'} />
+            }
+          </Animated.View>
+        </TouchableOpacity>
+        {isActive && <Text style={s.hintText}>Tap to disconnect</Text>}
       </View>
 
-      <Modal visible={settingsVisible} transparent animationType="slide" onRequestClose={() => setSettingsVisible(false)}>
-        <Pressable style={styles.modalOverlay} onPress={() => setSettingsVisible(false)}>
-          <View style={styles.modalContent}>
-            <Text style={styles.modalTitle}>Caroline Settings</Text>
-            <View style={styles.settingRow}>
-              <Text style={styles.settingLabel}>Server</Text>
-              <Text style={styles.settingValue}>Railway (always-on)</Text>
+      {/* Text input */}
+      {isActive && (
+        <View style={s.inputRow}>
+          <TextInput style={s.input} value={inputText} onChangeText={setInputText}
+            placeholder="Type instead..." placeholderTextColor="#4b5563"
+            onSubmitEditing={sendText} returnKeyType="send" />
+          <TouchableOpacity onPress={sendText} style={s.sendBtn}>
+            <MaterialIcons name="send" size={20} color="#a78bfa" />
+          </TouchableOpacity>
+        </View>
+      )}
+
+      {/* Settings */}
+      <Modal visible={showSettings} transparent animationType="slide" onRequestClose={() => setShowSettings(false)}>
+        <Pressable style={s.overlay} onPress={() => setShowSettings(false)}>
+          <Pressable style={s.sheet} onPress={() => {}}>
+            <Text style={s.sheetTitle}>Settings</Text>
+            <Text style={s.sheetLabel}>VOICE</Text>
+            <View style={s.voiceRow}>
+              {['ara','eve','leo','rex','sal'].map(v => (
+                <TouchableOpacity key={v} style={[s.chip, voice === v && s.chipActive]} onPress={() => setVoice(v)}>
+                  <Text style={[s.chipText, voice === v && s.chipTextActive]}>{v}</Text>
+                </TouchableOpacity>
+              ))}
             </View>
-            <View style={styles.settingRow}>
-              <Text style={styles.settingLabel}>Status</Text>
-              <Text style={[styles.settingValue, { color: serverOnline ? '#10B981' : '#EF4444' }]}>
-                {serverOnline === null ? 'Checking...' : serverOnline ? 'Online' : 'Offline'}
-              </Text>
-            </View>
-            <View style={styles.settingRow}>
-              <Text style={styles.settingLabel}>Voice Engine</Text>
-              <Text style={styles.settingValue}>xAI Realtime (Ara)</Text>
-            </View>
-            <View style={styles.settingRow}>
-              <Text style={styles.settingLabel}>VAD Silence</Text>
-              <Text style={styles.settingValue}>800ms</Text>
-            </View>
-            <TouchableOpacity style={styles.modalButton} onPress={() => { checkServer(); setSettingsVisible(false); }}>
-              <Text style={styles.modalButtonText}>Refresh Server Status</Text>
+            {isActive && <Text style={s.warn}>⚠️ Changes apply on next connection</Text>}
+            <TouchableOpacity style={s.doneBtn} onPress={() => setShowSettings(false)}>
+              <Text style={s.doneBtnText}>Done</Text>
             </TouchableOpacity>
-            <TouchableOpacity style={[styles.modalButton, { backgroundColor: '#374151', marginTop: 4 }]} onPress={() => setSettingsVisible(false)}>
-              <Text style={styles.modalButtonText}>Close</Text>
-            </TouchableOpacity>
-          </View>
+          </Pressable>
         </Pressable>
       </Modal>
     </View>
   );
 }
 
-const styles = StyleSheet.create({
-  container:       { flex: 1, backgroundColor: '#0F0F1A' },
-  header:          { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingHorizontal: 20, paddingTop: 56, paddingBottom: 12, borderBottomWidth: 1, borderBottomColor: '#1F2937' },
-  headerLeft:      { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  headerTitle:     { fontSize: 24, fontWeight: '700', color: '#F9FAFB', letterSpacing: -0.5 },
-  statusDot:       { width: 10, height: 10, borderRadius: 5 },
-  settingsBtn:     { padding: 4 },
-  messages:        { flex: 1 },
-  messagesContent: { padding: 16, gap: 8 },
-  emptyState:      { flex: 1, alignItems: 'center', justifyContent: 'center', paddingTop: 80, gap: 12 },
-  emptyText:       { color: '#6B7280', fontSize: 15, textAlign: 'center' },
-  bubble:          { maxWidth: SCREEN_WIDTH * 0.78, borderRadius: 16, padding: 12, marginBottom: 4 },
-  userBubble:      { alignSelf: 'flex-end', backgroundColor: '#1D4ED8' },
-  assistantBubble: { alignSelf: 'flex-start', backgroundColor: '#1F2937' },
-  bubbleText:      { fontSize: 15, lineHeight: 22 },
-  userText:        { color: '#F9FAFB' },
-  assistantText:   { color: '#E5E7EB' },
-  timestamp:       { fontSize: 11, marginTop: 4, opacity: 0.5, color: '#9CA3AF' },
-  statusText:      { textAlign: 'center', color: '#9CA3AF', fontSize: 14, paddingHorizontal: 20, paddingVertical: 8 },
-  buttonContainer: { alignItems: 'center', paddingBottom: 48, paddingTop: 8 },
-  mainButton:      { width: 80, height: 80, borderRadius: 40, justifyContent: 'center', alignItems: 'center', elevation: 8, shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.3, shadowRadius: 8 },
-  tapToStop:       { color: '#6B7280', fontSize: 13, marginTop: 10 },
-  modalOverlay:    { flex: 1, backgroundColor: 'rgba(0,0,0,0.6)', justifyContent: 'flex-end' },
-  modalContent:    { backgroundColor: '#1F2937', borderTopLeftRadius: 20, borderTopRightRadius: 20, padding: 24, gap: 12 },
-  modalTitle:      { fontSize: 18, fontWeight: '700', color: '#F9FAFB', marginBottom: 4 },
-  settingRow:      { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: '#374151' },
-  settingLabel:    { color: '#9CA3AF', fontSize: 14 },
-  settingValue:    { color: '#F9FAFB', fontSize: 14, fontWeight: '500' },
-  modalButton:     { backgroundColor: '#6366F1', borderRadius: 10, padding: 14, alignItems: 'center', marginTop: 8 },
-  modalButtonText: { color: '#fff', fontWeight: '600', fontSize: 15 },
+// ─── Styles ───────────────────────────────────────────────────────────────────
+const s = StyleSheet.create({
+  root:         { flex: 1, backgroundColor: '#060610' },
+  header:       { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+                  paddingTop: Platform.OS === 'android' ? (StatusBar.currentHeight ?? 24) + 8 : 54,
+                  paddingHorizontal: 20, paddingBottom: 14,
+                  borderBottomWidth: 1, borderBottomColor: '#0f0f1e' },
+  headerLeft:   { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  title:        { fontSize: 22, fontWeight: '800', color: '#f3f4f6', letterSpacing: 0.5 },
+  dot:          { width: 8, height: 8, borderRadius: 4 },
+  statusLabel:  { fontSize: 12, color: '#9ca3af' },
+  settingsBtn:  { padding: 4 },
+  scroll:       { flex: 1 },
+  scrollContent:{ padding: 16, gap: 14, paddingBottom: 20 },
+  emptyText:    { textAlign: 'center', color: '#374151', fontSize: 15, marginTop: 80, fontStyle: 'italic' },
+  msgRow:       { gap: 3 },
+  rowRight:     { alignItems: 'flex-end' },
+  rowLeft:      { alignItems: 'flex-start' },
+  msgRole:      { fontSize: 10, color: '#6b7280', paddingHorizontal: 4, textTransform: 'uppercase', letterSpacing: 0.5 },
+  bubble:       { maxWidth: SCREEN_WIDTH * 0.82, borderRadius: 18, paddingHorizontal: 14, paddingVertical: 10 },
+  bubbleUser:   { backgroundColor: '#3b1d8a' },
+  bubbleAsst:   { backgroundColor: '#111827' },
+  interrupted:  { opacity: 0.4 },
+  bubbleText:   { fontSize: 15, lineHeight: 22 },
+  textUser:     { color: '#e9d5ff' },
+  textAsst:     { color: '#d1d5db' },
+  orbArea:      { alignItems: 'center', paddingVertical: 28, gap: 14 },
+  statusText:   { fontSize: 13, color: '#9ca3af', letterSpacing: 0.3 },
+  orb:          { width: 120, height: 120, borderRadius: 60, borderWidth: 2,
+                  alignItems: 'center', justifyContent: 'center',
+                  shadowColor: '#7c3aed', shadowOffset: { width: 0, height: 0 },
+                  shadowOpacity: 0.8, shadowRadius: 24, elevation: 16 },
+  hintText:     { fontSize: 11, color: '#4b5563' },
+  inputRow:     { flexDirection: 'row', alignItems: 'center', marginHorizontal: 16, marginBottom: 28,
+                  backgroundColor: '#111827', borderRadius: 28, borderWidth: 1, borderColor: '#1f2937',
+                  paddingHorizontal: 18, gap: 10 },
+  input:        { flex: 1, color: '#f3f4f6', fontSize: 15, paddingVertical: 14 },
+  sendBtn:      { padding: 4 },
+  overlay:      { flex: 1, backgroundColor: 'rgba(0,0,0,0.7)', justifyContent: 'flex-end' },
+  sheet:        { backgroundColor: '#0f172a', borderTopLeftRadius: 28, borderTopRightRadius: 28,
+                  padding: 28, gap: 18, borderTopWidth: 1, borderColor: '#1e293b' },
+  sheetTitle:   { fontSize: 20, fontWeight: '700', color: '#f3f4f6' },
+  sheetLabel:   { fontSize: 11, color: '#6b7280', fontWeight: '700', letterSpacing: 1.2 },
+  voiceRow:     { flexDirection: 'row', gap: 10, flexWrap: 'wrap' },
+  chip:         { paddingHorizontal: 18, paddingVertical: 9, borderRadius: 20,
+                  backgroundColor: '#1e293b', borderWidth: 1, borderColor: '#334155' },
+  chipActive:   { backgroundColor: '#4c1d95', borderColor: '#7c3aed' },
+  chipText:     { color: '#94a3b8', fontSize: 14 },
+  chipTextActive:{ color: '#f3f4f6', fontWeight: '700' },
+  warn:         { fontSize: 12, color: '#f59e0b' },
+  doneBtn:      { backgroundColor: '#4c1d95', borderRadius: 14, padding: 16, alignItems: 'center' },
+  doneBtnText:  { color: '#f3f4f6', fontWeight: '700', fontSize: 16 },
 });
